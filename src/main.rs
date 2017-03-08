@@ -1,34 +1,7 @@
-#[macro_use]
-extern crate serde_derive;
-extern crate serde_yaml;
 extern crate clap;
+extern crate reqwest;
 
-use std::io::prelude::*;
-use std::error::Error;
-use std::fs::File;
-use std::collections::BTreeMap;
-use std::path::Path;
-
-#[derive(Deserialize, Debug)]
-struct Application {
-    name: String,
-    environments: BTreeMap<String, String>,
-    endpoints: Vec<String>
-}
-
-impl Application {
-    fn urls_for_environment(&self, environment_key: &str) -> Result<Vec<String>> {
-        let environment = match self.environments.get(environment_key) {
-            Some(environment) => environment,
-            None => return None
-        };
-    }
-}
-
-#[derive(Deserialize, Debug)]
-struct Config {
-    apps: BTreeMap<String, Application>
-}
+mod config;
 
 fn main() {
     let default_config_path = get_default_config_path();
@@ -61,28 +34,9 @@ fn main() {
             .help("Sets the environment to test"))
         .get_matches();
 
-    let config_path = args.value_of("config").unwrap();
-
-    let mut file = match File::open(config_path) {
-        Ok(file)   => file,
-        Err(error) => panic!("Failed to open config file {}: {}", config_path, error.description())
-    };
-
-    let mut yaml = String::new();
-    match file.read_to_string(&mut yaml) {
-        Ok(size)   => size,
-        Err(error) => {
-            println!("{:?}", error);
-            panic!("Unable to read from config file {}: {}", config_path, error.description());
-        }
-    };
-
-    let config: Config = match serde_yaml::from_str(&yaml) {
+    let config: config::Config = match config::read(args.value_of("config")) {
         Ok(config) => config,
-        Err(error) => {
-            println!("");
-            panic!("Unable to parse config file {}: {}", config_path, error.description());
-        }
+        Err(error) => panic!("Unable to parse config file {}: {}", config_path, error.description())
     };
 
     let app_key = args.value_of("app").unwrap();
@@ -94,9 +48,39 @@ fn main() {
 
     let environment_key = args.value_of("environment").unwrap();
 
-    let urls = app.urls_for_environment(environment_key);
+    if !app.environments.contains_key(environment_key) {
+        panic!("Application {} does not contain environment {}", app_key, environment_key);
+    }
 
-    println!("{:?}", app);
+    let urls = match app.urls_for_environment(environment_key) {
+        Some(urls) => urls,
+        None => panic!("Unable to get endpoints for environment {} in {}", environment_key, app_key)
+    };
+
+    let client = match reqwest::Client::new() {
+        Ok(client) => client,
+        Err(error) => panic!("Failed to create HTTP client: {}", error.description())
+    };
+
+    let (tx, rx) = mpsc::channel();
+
+    for url in urls.iter() {
+        let tx = tx.clone();
+
+        thread::spawn(move || {
+            match client.get(url).send() {
+                Ok(response) => tx.send(Ok(response)).unwrap(),
+                Err(error) => tx.send(Err(error)).unwrap()
+            };
+        });
+    }
+
+    for url in urls.iter() {
+        match rx.recv().unwrap() {
+            Ok(response) => println!("{} {:?}", url, response.status()),
+            Err(error)   => panic!("Failed to GET {}: {}", url, error.description())
+        }
+    }
 }
 
 fn get_default_config_path() -> String {
